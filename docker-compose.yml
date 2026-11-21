@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/migration.db
+    volumes:
+      - migration-data:/data
+    restart: unless-stopped
+
+volumes:
+  migration-data:
