@@ -101,8 +101,15 @@ def transaction(path: str) -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def readonly(path: str) -> Iterator[sqlite3.Connection]:
+    """读事务：BEGIN 后所有 SELECT 共享同一 WAL 快照。
+
+    范围查询由多条 SELECT 组成（逐日、逐班次）。若不显式开启读事务，写入可能在
+    两条 SELECT 之间提交，导致同一响应里一半是改挂前、一半是改挂后的点位。
+    """
     conn = connect(path)
     try:
+        conn.execute("BEGIN")
         yield conn
     finally:
+        conn.rollback()
         conn.close()

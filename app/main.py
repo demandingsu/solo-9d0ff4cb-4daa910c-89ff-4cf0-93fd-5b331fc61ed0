@@ -13,7 +13,12 @@ from fastapi import FastAPI, Query
 from fastapi.responses import RedirectResponse
 
 from . import db, service
-from .schemas import ImportRequest, LegacyImportRequest, SwitchRequest
+from .schemas import (
+    ImportRequest,
+    LegacyImportRequest,
+    RebindRequest,
+    SwitchRequest,
+)
 
 DESCRIPTION = """
 公交定位点迁仓：按采样日入仓 → 跨夜整趟轨迹归发车日（UTC）。
@@ -25,7 +30,10 @@ DESCRIPTION = """
 3. `GET /dates/{date}/state` 查看该日回填状态指纹。
 4. `POST /dates/{date}/switch` 携带回填时确认的指纹切换供数来源；
    回填后轨迹有变时指纹失效，切换被退回并提示重做。
-5. `GET /trips` 按日期范围查询：每趟车只出现一次，点位来自同一提交状态。
+5. `POST /trips/rebind` 改挂：把换班时误报到上一班的定位点改挂到下一班。
+   携带双方班次核对时的批次版本与源点号→目标点号对应关系；只要涉及的点位仍与
+   核对时一致，就在双方最新批次上改挂，保留后来补传的其他点；有冲突则列出点号整笔退回。
+6. `GET /trips` 按日期范围查询：每趟车只出现一次，点位来自同一提交状态。
 """
 
 
@@ -82,6 +90,20 @@ def create_app() -> FastAPI:
     def switch_service_date(service_date: date, payload: SwitchRequest):
         with db.transaction(db_path) as conn:
             return service.switch_date(conn, service_date, payload.expected_state)
+
+    @app.post(
+        "/trips/rebind",
+        tags=["迁移"],
+        summary="把误归属到上一班的定位点改挂到下一班",
+        description="接收两个已在新仓供数的班次号、数据员核对时各自的批次版本，"
+        "以及源点号→目标点号的一一对应关系。源点内容与目标点号上的记录仍与核对时"
+        "一致时，在双方最新批次上改挂（保留核对后补传的其他点）；目标点号已有相同"
+        "采样时刻和坐标时只从源班次移除。源点缺失、涉及点位有变化、目标点号被不同"
+        "的点占用时，返回 409 并列出冲突点号，整笔退回。两个新批次在同一事务内生效。",
+    )
+    def rebind_trip_points(payload: RebindRequest):
+        with db.transaction(db_path) as conn:
+            return service.rebind_points(conn, payload)
 
     @app.get(
         "/trips",

@@ -83,6 +83,66 @@ def _is_switched(conn, service_date: str) -> bool:
     return row is not None
 
 
+# ---------- 批次读取（改挂用） ----------
+
+def _batch_at_version(conn, trip_id: int, version: int):
+    return conn.execute(
+        "SELECT * FROM batches WHERE trip_id = ? AND version = ?",
+        (trip_id, version),
+    ).fetchone()
+
+
+def _batch_by_id(conn, batch_id: Optional[int]):
+    if batch_id is None:
+        return None
+    return conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+
+
+def _points_map(conn, batch_id: Optional[int]) -> dict[int, dict]:
+    """批次内 seq → 点位内容。批次为空时返回空字典。"""
+    if batch_id is None:
+        return {}
+    return {
+        r["seq"]: {"sampled_at": r["sampled_at"], "lat": r["lat"], "lon": r["lon"]}
+        for r in conn.execute(
+            "SELECT seq, sampled_at, lat, lon FROM points WHERE batch_id = ?",
+            (batch_id,),
+        )
+    }
+
+
+def _same_point(a: dict, b: dict) -> bool:
+    """采样时刻与坐标是否一致（坐标按浮点容差比较，等价于同一份上报值）。"""
+    return (
+        a["sampled_at"] == b["sampled_at"]
+        and abs(a["lat"] - b["lat"]) < 1e-9
+        and abs(a["lon"] - b["lon"]) < 1e-9
+    )
+
+
+def _new_batch(conn, trip_id: int, points: dict[int, dict], now: str) -> int:
+    """把一份全量点位写成新批次，返回批次 id。version 按班次递增。"""
+    norm = [
+        {"seq": seq, "sampled_at": p["sampled_at"], "lat": p["lat"], "lon": p["lon"]}
+        for seq, p in sorted(points.items())
+    ]
+    prev = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM batches WHERE trip_id = ?",
+        (trip_id,),
+    ).fetchone()["v"]
+    cur = conn.execute(
+        "INSERT INTO batches (trip_id, version, submitted_at, point_count, points_hash)"
+        " VALUES (?,?,?,?,?)",
+        (trip_id, prev + 1, now, len(norm), _points_hash(norm)),
+    )
+    batch_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO points (batch_id, seq, sampled_at, lat, lon) VALUES (?,?,?,?,?)",
+        [(batch_id, p["seq"], p["sampled_at"], p["lat"], p["lon"]) for p in norm],
+    )
+    return batch_id
+
+
 # ---------- 导入 ----------
 
 def import_legacy(conn, payload) -> dict:
@@ -239,6 +299,186 @@ def switch_date(conn, service_date: date, expected_state: str) -> dict:
         "switched_at": now,
         "activated_trips": cur.rowcount,
         "state_token": state["state_token"],
+    }
+
+
+# ---------- 班次改挂 ----------
+
+def rebind_points(conn, payload) -> dict:
+    """把误报到上一班的定位点改挂到下一班，作用在双方最新批次上。
+
+    核对口径：请求携带数据员核对时双方班次的批次版本。只要"源点内容"和"目标点号上
+    的记录"仍与核对时一致，就在**双方最新批次**上改挂——核对之后补传的其他点保留。
+
+    - 源点缺失：conflict（source_missing）；
+    - 源点内容与核对版本不一致：conflict（point_changed）；
+    - 目标点号上的记录与核对版本不一致（新增/删除/内容变化）：conflict（target_changed）；
+    - 目标点号被不同的点占用：conflict（target_occupied）；
+    - 目标点号在核对时已有相同采样时刻和坐标：只从源班次移除，不重复写入目标；
+    - 任一项冲突：整笔退回，响应列出全部冲突点号，不写入任何批次。
+
+    只对内容实际变化的班次生成新批次；两班都变化时，两个新批次与两个 current 指针
+    在同一个事务里提交，范围查询不会读到一半改挂前、一半改挂后的点位。
+    """
+    now = now_iso()
+    conflicts: list[dict] = []
+
+    src = conn.execute(
+        "SELECT * FROM trips WHERE trip_code = ?", (payload.source_trip_code,)
+    ).fetchone()
+    dst = conn.execute(
+        "SELECT * FROM trips WHERE trip_code = ?", (payload.target_trip_code,)
+    ).fetchone()
+    for code, row in (
+        (payload.source_trip_code, src),
+        (payload.target_trip_code, dst),
+    ):
+        if row is None:
+            raise HTTPException(404, f"班次 {code} 不存在")
+        if not row["active_in_new"]:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": f"班次 {code} 尚未在新仓供数，不能改挂",
+                    "trip_code": code,
+                    "active_in_new": False,
+                },
+            )
+
+    src_cur = _batch_by_id(conn, src["current_batch_id"])
+    dst_cur = _batch_by_id(conn, dst["current_batch_id"])
+    if src_cur is None or dst_cur is None:
+        raise HTTPException(409, "班次尚未提交点位，不能改挂")
+
+    src_ref = _batch_at_version(conn, src["id"], payload.source_batch_version)
+    dst_ref = _batch_at_version(conn, dst["id"], payload.target_batch_version)
+    if src_ref is None:
+        raise HTTPException(
+            409,
+            detail={
+                "message": f"源班次 {payload.source_trip_code} 没有批次版本 "
+                f"{payload.source_batch_version}，请重新核对",
+                "conflicts": [{"source_seq": m.source_seq,
+                               "reason": "source_batch_not_found"}
+                              for m in payload.mappings],
+            },
+        )
+    if dst_ref is None:
+        raise HTTPException(
+            409,
+            detail={
+                "message": f"目标班次 {payload.target_trip_code} 没有批次版本 "
+                f"{payload.target_batch_version}，请重新核对",
+                "conflicts": [{"target_seq": m.target_seq,
+                               "reason": "target_batch_not_found"}
+                              for m in payload.mappings],
+            },
+        )
+
+    src_current = _points_map(conn, src_cur["id"])
+    dst_current = _points_map(conn, dst_cur["id"])
+    src_checked = _points_map(conn, src_ref["id"])
+    dst_checked = _points_map(conn, dst_ref["id"])
+
+    for m in payload.mappings:
+        s_seq, d_seq = m.source_seq, m.target_seq
+        src_point = src_current.get(s_seq)
+        if src_point is None:
+            conflicts.append(
+                {"source_seq": s_seq, "target_seq": d_seq, "reason": "source_missing"}
+            )
+            continue
+        # 源点内容必须仍与核对时一致（核对版本里没有该点也算变化）
+        checked = src_checked.get(s_seq)
+        if checked is None or not _same_point(src_point, checked):
+            conflicts.append(
+                {"source_seq": s_seq, "target_seq": d_seq, "reason": "point_changed"}
+            )
+            continue
+
+        existing = dst_current.get(d_seq)
+        checked_target = dst_checked.get(d_seq)
+        if existing is not None and not _same_point(existing, src_point):
+            # 目标点号当前被不同的点占用
+            conflicts.append(
+                {"source_seq": s_seq, "target_seq": d_seq, "reason": "target_occupied"}
+            )
+            continue
+        if existing is None:
+            if checked_target is not None:
+                # 核对时目标点号上有记录，现在没了（删除/改号）
+                conflicts.append(
+                    {"source_seq": s_seq, "target_seq": d_seq, "reason": "target_changed"}
+                )
+            # 核对时为空、现在仍为空：直接改挂
+            continue
+        # 现在目标点号上就是源点本身：只有核对时也已如此才允许（去重）；
+        # 核对后目标才出现/变化成同一个点，说明涉及的点位在核对后有变
+        if checked_target is not None and _same_point(checked_target, existing):
+            continue
+        conflicts.append(
+            {"source_seq": s_seq, "target_seq": d_seq, "reason": "target_changed"}
+        )
+
+    if conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "改挂涉及的点位与核对时不一致，整笔已退回，请重新核对点位后重试",
+                "source_trip_code": payload.source_trip_code,
+                "target_trip_code": payload.target_trip_code,
+                "conflicts": conflicts,
+            },
+        )
+
+    # 无冲突：在双方最新批次上重算全量点位
+    new_src = dict(src_current)
+    new_dst = dict(dst_current)
+    moved, deduped = [], []
+    for m in payload.mappings:
+        point = new_src.pop(m.source_seq)
+        existing = new_dst.get(m.target_seq)
+        if existing is not None and _same_point(existing, point):
+            # 目标点号已有相同采样时刻和坐标：只从源班次移除
+            deduped.append({"source_seq": m.source_seq, "target_seq": m.target_seq})
+        else:
+            new_dst[m.target_seq] = point
+            moved.append({"source_seq": m.source_seq, "target_seq": m.target_seq})
+
+    src_batch_id = _new_batch(conn, src["id"], new_src, now)
+    conn.execute(
+        "UPDATE trips SET current_batch_id=?, updated_at=? WHERE id=?",
+        (src_batch_id, now, src["id"]),
+    )
+    # 只有实际移入了新点才给目标班次生成新批次（纯去重时目标内容不变）
+    dst_batch_id = dst_cur["id"]
+    if moved:
+        dst_batch_id = _new_batch(conn, dst["id"], new_dst, now)
+        conn.execute(
+            "UPDATE trips SET current_batch_id=?, updated_at=? WHERE id=?",
+            (dst_batch_id, now, dst["id"]),
+        )
+
+    affected_dates = sorted({src["departure_date"], dst["departure_date"]})
+    return {
+        "status": "rebound",
+        "source_trip_code": payload.source_trip_code,
+        "target_trip_code": payload.target_trip_code,
+        "moved": moved,
+        "deduped": deduped,
+        "source": {
+            "trip_code": src["trip_code"],
+            "checked_batch_version": payload.source_batch_version,
+            "batch_version": src_cur["version"] + 1,
+            "point_count": len(new_src),
+        },
+        "target": {
+            "trip_code": dst["trip_code"],
+            "checked_batch_version": payload.target_batch_version,
+            "batch_version": dst_cur["version"] + (1 if moved else 0),
+            "point_count": len(new_dst),
+        },
+        "dates": [date_state(conn, d) for d in affected_dates],
     }
 
 

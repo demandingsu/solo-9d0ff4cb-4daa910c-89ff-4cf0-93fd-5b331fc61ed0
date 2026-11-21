@@ -67,3 +67,40 @@ class SwitchRequest(BaseModel):
         min_length=1,
         description="回填核对时拿到的状态指纹（GET /dates/{date}/state 的 state_token）",
     )
+
+
+class PointRebindMapping(BaseModel):
+    """一条改挂对应关系：把源班次的 source_seq 点改挂到目标班次的 target_seq。"""
+
+    source_seq: int = Field(ge=1, description="源班次的定位点编号")
+    target_seq: int = Field(ge=1, description="目标班次上承载该点的定位点编号")
+
+
+class RebindRequest(BaseModel):
+    """班次改挂：把上一班误收的定位点改挂到下一班。
+
+    两个班次都必须已在新仓供数；两个 batch_version 是数据员核对时看到的版本，
+    用于确认"涉及的点位"自核对以来没有变化。改挂作用在双方**最新**批次上，
+    因此核对之后补传的其他点会原样保留。
+    """
+
+    source_trip_code: str = Field(min_length=1, max_length=64, description="源班次号（误收点的一班）")
+    source_batch_version: int = Field(ge=1, description="核对时源班次的批次版本")
+    target_trip_code: str = Field(min_length=1, max_length=64, description="目标班次号（点应归属的一班）")
+    target_batch_version: int = Field(ge=1, description="核对时目标班次的批次版本")
+    mappings: List[PointRebindMapping] = Field(
+        min_length=1,
+        description="源点号→目标点号的一一对应关系（源点号、目标点号各自不得重复）",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "RebindRequest":
+        if self.source_trip_code == self.target_trip_code:
+            raise ValueError("源班次与目标班次不能相同")
+        sources = [m.source_seq for m in self.mappings]
+        targets = [m.target_seq for m in self.mappings]
+        if len(sources) != len(set(sources)):
+            raise ValueError("同一请求内 source_seq 重复，改挂关系须一一对应")
+        if len(targets) != len(set(targets)):
+            raise ValueError("同一请求内 target_seq 重复，改挂关系须一一对应")
+        return self
